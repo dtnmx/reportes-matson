@@ -7,9 +7,13 @@ para el proceso de carga al portal MATSON.
 
 Basado en Sit_Cobranza_DescargarReporte.py — reutiliza login, alert,
 pop-up diario, logout y sistema de logs.
+
+Clasificación de documentos a descargar (derivada automáticamente del Excel):
+  - "LG ELECTRONICS" en Ruta/Concepto  →  LG   →  solo CI
+  - Tipo de Viaje = "EXPORTACION"       →  USA  →  CI, BOL y POD
+  - Cualquier otro caso                 →  TODOS →  CI y BOL
 """
 
-import os
 import sys
 import time
 import shutil
@@ -35,60 +39,76 @@ GM_USUARIO    = "DTN"
 GM_CONTRASENA = "RenGax8*"
 
 # --- Archivo Excel de entrada ---
-ARCHIVO_EXCEL        = "viajes_matson.xlsx"   # Ruta al Excel de viajes
-COLUMNA_NUMERO_VIAJE = "Numero_Viaje"          # Columna con el número de viaje
-COLUMNA_TIPO_DESTINO = "Tipo_Destino"          # Columna con el tipo de destino
+# Cambiar esta ruta al Excel del batch correspondiente.
+ARCHIVO_EXCEL = r"I:\Mi unidad\DTN\Proyectos\Sega Carriers\2026-04-07_DTN-SEG-009\Documentos\CARGA MATSON 28 ABRIL.xlsx"
+
+# Nombres de columna exactos del Excel de Facturación (no modificar salvo que cambie el formato)
+COLUMNA_NUMERO_VIAJE  = "Núm. de Viaje"    # Número de viaje en GM
+COLUMNA_TIPO_VIAJE    = "Tipo de Viaje"    # "INTERMODAL" o "EXPORTACION"
+COLUMNA_RUTA_CONCEPTO = "Ruta/Concepto"    # Contiene el nombre del cliente (ej. "LG ELECTRONICS")
+
+# Palabra clave en Ruta/Concepto para identificar viajes LG (insensible a mayúsculas)
+KEYWORD_LG = "LG ELECTRONICS"
 
 # --- Carpeta de salida ---
+# Se crea automáticamente con la fecha del día. Ej: MATSON_Docs_20260428
 FECHA_HOY    = datetime.now().strftime("%Y%m%d")
 CARPETA_BASE = f"MATSON_Docs_{FECHA_HOY}"
 
-# --- Documentos a descargar por tipo de destino ---
-#     Las claves deben estar en MAYÚSCULAS; el valor es la lista de tipos de doc.
+# --- Documentos a descargar por tipo ---
 DOCS_POR_TIPO = {
     "LG":    ["CI"],
     "USA":   ["CI", "BOL", "POD"],
-    "TODOS": ["CI", "BOL"],        # Valor por defecto cuando Tipo_Destino no es LG ni USA
+    "TODOS": ["CI", "BOL"],
 }
 
 # --- Tiempos de espera (segundos) ---
-TIMEOUT_ESPERA  = 10   # WebDriverWait timeout general
-SLEEP_LOGIN     = 5    # Tras clic de login y tras cerrar alert
-SLEEP_MODULO    = 3    # Tras navegar entre módulos/secciones del menú
-SLEEP_FILTRO    = 2    # Tras escribir en el buscador de la tabla de viajes
-SLEEP_POPUP     = 3    # Tras abrir o cerrar la ventana de documentos adjuntos
-SLEEP_DESCARGA  = 10   # Segundos máximos para que aparezca el archivo descargado
-SLEEP_RETRY     = 3    # Espera antes de reintentar una descarga fallida
+TIMEOUT_ESPERA = 10   # WebDriverWait timeout general
+SLEEP_LOGIN    = 5    # Tras clic de login y tras cerrar alert
+SLEEP_MODULO   = 3    # Tras navegar entre módulos/secciones del menú
+SLEEP_FILTRO   = 2    # Tras escribir en el buscador de la tabla de viajes
+SLEEP_POPUP    = 3    # Tras abrir o cerrar la ventana de documentos adjuntos
+SLEEP_DESCARGA = 12   # Segundos máximos para que aparezca el archivo descargado
+SLEEP_RETRY    = 3    # Espera antes de reintentar una descarga fallida
 
 # ============================================================
 #  FUNCIONES AUXILIARES
 # ============================================================
 
-def esperar_archivo_nuevo(carpeta: Path, archivos_antes: set, timeout: int = SLEEP_DESCARGA) -> "Path | None":
-    """Bloquea hasta que aparezca un archivo nuevo y completo (no .crdownload) en carpeta."""
+def determinar_tipo_descarga(tipo_viaje: str, ruta_concepto: str) -> str:
+    """
+    Determina el tipo de descarga (LG / USA / TODOS) a partir de las
+    columnas del Excel de Facturación, sin necesitar columna extra.
+    """
+    ruta = str(ruta_concepto).upper()
+    tipo = str(tipo_viaje).upper().strip()
+
+    if KEYWORD_LG.upper() in ruta:
+        return "LG"
+    elif tipo == "EXPORTACION":
+        return "USA"
+    else:
+        return "TODOS"
+
+
+def esperar_archivo_nuevo(carpeta: Path, archivos_antes: set, timeout: int = SLEEP_DESCARGA):
+    """Espera hasta que aparezca un archivo nuevo y completo (no .crdownload) en carpeta."""
     fin = time.time() + timeout
     while time.time() < fin:
         ahora = {f for f in carpeta.iterdir() if f.is_file()}
         nuevos = ahora - archivos_antes
         completados = [f for f in nuevos if f.suffix.lower() != ".crdownload"]
         if completados:
-            # Devolver el más reciente por fecha de modificación
             return sorted(completados, key=lambda f: f.stat().st_mtime)[-1]
         time.sleep(1)
     return None
 
 
-def docs_para_viaje(tipo_destino: str) -> list:
-    """Retorna la lista de tipos de documento a descargar según el tipo de destino."""
-    clave = tipo_destino.upper().strip() if isinstance(tipo_destino, str) else "TODOS"
-    return DOCS_POR_TIPO.get(clave, DOCS_POR_TIPO["TODOS"])
-
-
 def fila_contiene_tipo_doc(texto_fila: str, tipo_doc: str) -> bool:
     """
-    Verifica si el texto de una fila de documentos corresponde al tipo buscado.
-    Compara en mayúsculas; por ejemplo 'CI', 'BOL', 'POD' deben aparecer en el texto.
-    Ajusta esta función si el sistema usa nombres completos como 'CARTA PORTE', etc.
+    Verifica si el texto de una fila de la ventana de documentos corresponde al tipo buscado.
+    Busca el código exacto (CI, BOL, POD) en el texto de la fila.
+    Ajustar si GM usa nombres completos como "CARTA PORTE", "BILL OF LADING", etc.
     """
     return tipo_doc.upper() in texto_fila.upper()
 
@@ -99,10 +119,10 @@ def fila_contiene_tipo_doc(texto_fila: str, tipo_doc: str) -> bool:
 
 hora_actual = datetime.now().hour
 
-# Crear carpeta de salida y carpeta temporal de descargas
+# Crear carpeta de salida y subcarpeta temporal de descargas
 carpeta_salida = Path(CARPETA_BASE)
 carpeta_salida.mkdir(exist_ok=True)
-carpeta_temp   = carpeta_salida / "_temp_downloads"
+carpeta_temp = carpeta_salida / "_temp_downloads"
 carpeta_temp.mkdir(exist_ok=True)
 
 options = webdriver.ChromeOptions()
@@ -119,13 +139,13 @@ options.add_argument("--disable-gpu")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 
-# Configurar carpeta de descarga automática (evita cuadros de diálogo de guardar)
+# Configurar descarga automática a carpeta temporal (sin cuadro de diálogo)
 prefs = {
-    "download.default_directory":    str(carpeta_temp.resolve()),
-    "download.prompt_for_download":  False,
-    "download.directory_upgrade":    True,
+    "download.default_directory":         str(carpeta_temp.resolve()),
+    "download.prompt_for_download":       False,
+    "download.directory_upgrade":         True,
     "plugins.always_open_pdf_externally": True,
-    "safebrowsing.enabled":          True,
+    "safebrowsing.enabled":               True,
 }
 options.add_experimental_option("prefs", prefs)
 
@@ -140,7 +160,7 @@ wait    = WebDriverWait(driver, TIMEOUT_ESPERA)
 escribir_log("📌 Iniciando sesión en GM Transport...")
 driver.get(GM_URL_LOGIN)
 time.sleep(2)
-time.sleep(5)  # Esperar que la página cargue completamente
+time.sleep(5)  # Esperar carga completa de la página
 
 driver.find_element(By.NAME, "EDT_EMPRESA").send_keys(GM_EMPRESA)
 driver.find_element(By.NAME, "EDT_USUARIO").send_keys(GM_USUARIO)
@@ -148,7 +168,7 @@ driver.find_element(By.NAME, "EDT_CONTRASENA").send_keys(GM_CONTRASENA)
 driver.find_element(By.ID, "BTN_ENTRAR").click()
 time.sleep(SLEEP_LOGIN)
 
-# --- Manejo del alert de "sesión abierta" ---
+# --- Alert de "sesión abierta" ---
 time.sleep(3)
 try:
     alert = driver.switch_to.alert
@@ -158,12 +178,12 @@ try:
         alert.accept()
         escribir_log("✅ Alert de sesión abierta aceptado.")
     else:
-        escribir_log("ℹ️ Alert desconocido, aceptando de todas formas.")
+        escribir_log("ℹ️ Alert desconocido, aceptando.")
         alert.accept()
 except:
     escribir_log("ℹ️ No se detectó alert de sesión abierta.")
 
-# --- Manejo del pop-up diario ---
+# --- Pop-up diario ---
 try:
     time.sleep(8)
     checkbox = driver.find_element(By.ID, "CBOX_CHECKBOX1_1")
@@ -178,13 +198,15 @@ except:
     escribir_log("ℹ️ No se detectó pop-up diario. Continuando.")
 
 # ============================================================
-#  CARGAR EXCEL DE VIAJES
+#  CARGAR Y VALIDAR EXCEL DE VIAJES
 # ============================================================
 
 escribir_log(f"📌 Cargando archivo Excel: {ARCHIVO_EXCEL}")
 
 try:
-    df = pd.read_excel(ARCHIVO_EXCEL, dtype={COLUMNA_NUMERO_VIAJE: str})
+    df = pd.read_excel(ARCHIVO_EXCEL, dtype=str)
+    # Limpiar espacios en nombres de columnas por si el Excel trae espacios extra
+    df.columns = df.columns.str.strip()
 except FileNotFoundError:
     escribir_log(f"❌ No se encontró el archivo: {ARCHIVO_EXCEL}", nivel="error")
     driver.quit()
@@ -194,20 +216,25 @@ except Exception as e:
     driver.quit()
     sys.exit(1)
 
-if COLUMNA_NUMERO_VIAJE not in df.columns:
-    escribir_log(f"❌ El Excel no contiene la columna '{COLUMNA_NUMERO_VIAJE}'.", nivel="error")
-    driver.quit()
-    sys.exit(1)
+for col in [COLUMNA_NUMERO_VIAJE, COLUMNA_TIPO_VIAJE, COLUMNA_RUTA_CONCEPTO]:
+    if col not in df.columns:
+        escribir_log(f"❌ El Excel no contiene la columna requerida: '{col}'", nivel="error")
+        escribir_log(f"   Columnas encontradas: {list(df.columns)}", nivel="error")
+        driver.quit()
+        sys.exit(1)
 
-if COLUMNA_TIPO_DESTINO not in df.columns:
-    escribir_log(
-        f"⚠️ El Excel no contiene la columna '{COLUMNA_TIPO_DESTINO}'. "
-        "Se asumirá tipo 'TODOS' (CI + BOL) para todos los viajes."
-    )
-    df[COLUMNA_TIPO_DESTINO] = "TODOS"
+# Filtrar filas con número de viaje válido y calcular tipo de descarga
+df = df.dropna(subset=[COLUMNA_NUMERO_VIAJE]).copy()
+df[COLUMNA_NUMERO_VIAJE] = df[COLUMNA_NUMERO_VIAJE].str.strip().str.replace(r"\.0$", "", regex=True)
+df["_tipo_descarga"] = df.apply(
+    lambda r: determinar_tipo_descarga(r[COLUMNA_TIPO_VIAJE], r[COLUMNA_RUTA_CONCEPTO]),
+    axis=1
+)
 
-viajes_df = df[[COLUMNA_NUMERO_VIAJE, COLUMNA_TIPO_DESTINO]].dropna(subset=[COLUMNA_NUMERO_VIAJE]).copy()
-escribir_log(f"✅ {len(viajes_df)} viajes cargados del Excel.")
+escribir_log(f"✅ {len(df)} viajes cargados del Excel.")
+escribir_log("📌 Distribución de tipos de descarga:")
+for tipo, conteo in df["_tipo_descarga"].value_counts().items():
+    escribir_log(f"   {tipo}: {conteo} viajes → {DOCS_POR_TIPO[tipo]}")
 
 # ============================================================
 #  NAVEGAR A TRÁFICO → VIAJES
@@ -250,26 +277,27 @@ except Exception as e:
 #  PROCESAMIENTO DE VIAJES
 # ============================================================
 
-viajes_procesados    = 0
+viajes_procesados      = 0
 documentos_descargados = 0
-viajes_con_error     = []
+viajes_con_error       = []
 
-for _, fila_excel in viajes_df.iterrows():
+for _, fila_excel in df.iterrows():
     numero_viaje    = str(fila_excel[COLUMNA_NUMERO_VIAJE]).strip()
-    tipo_destino    = str(fila_excel[COLUMNA_TIPO_DESTINO]).strip()
-    docs_requeridos = docs_para_viaje(tipo_destino)
+    tipo_descarga   = fila_excel["_tipo_descarga"]
+    ruta_concepto   = str(fila_excel[COLUMNA_RUTA_CONCEPTO]).strip()
+    docs_requeridos = DOCS_POR_TIPO[tipo_descarga]
 
     escribir_log(f"\n{'='*60}")
     escribir_log(
-        f"📌 Procesando viaje: {numero_viaje} | "
-        f"Tipo destino: {tipo_destino} | Docs a descargar: {docs_requeridos}"
+        f"📌 Viaje: {numero_viaje} | Tipo: {tipo_descarga} | "
+        f"Ruta: {ruta_concepto[:50]} | Docs: {docs_requeridos}"
     )
 
-    # Crear carpeta destino del viaje
+    # Carpeta destino del viaje
     carpeta_viaje = carpeta_salida / numero_viaje
     carpeta_viaje.mkdir(exist_ok=True)
 
-    # ---- a) Buscar el viaje en la tabla ----
+    # ── a) Buscar el viaje en la tabla ──────────────────────────────────────
     try:
         buscador = wait.until(
             EC.presence_of_element_located(
@@ -280,11 +308,11 @@ for _, fila_excel in viajes_df.iterrows():
         buscador.send_keys(numero_viaje)
         time.sleep(SLEEP_FILTRO)
     except Exception as e:
-        escribir_log(f"⚠️ No se pudo acceder al buscador de viajes: {e}")
+        escribir_log(f"⚠️ No se pudo acceder al buscador para viaje {numero_viaje}: {e}")
         viajes_con_error.append(numero_viaje)
         continue
 
-    # ---- b) Clic en el ícono azul de documentos adjuntos (clip) ----
+    # ── b) Clic en ícono de documentos adjuntos (clip azul) ─────────────────
     try:
         link_doc = wait.until(
             EC.element_to_be_clickable(
@@ -296,10 +324,9 @@ for _, fila_excel in viajes_df.iterrows():
         escribir_log(f"📌 Ventana de documentos adjuntos abierta para viaje {numero_viaje}.")
     except Exception as e:
         escribir_log(
-            f"⚠️ Viaje {numero_viaje} no aparece en la tabla o no tiene ícono de documentos: {e}"
+            f"⚠️ Viaje {numero_viaje} no aparece en la tabla o sin ícono de docs: {e}"
         )
         viajes_con_error.append(numero_viaje)
-        # Limpiar buscador antes de continuar
         try:
             buscador = driver.find_element(
                 By.CSS_SELECTOR, "input[aria-controls='TABLE_ProViajes']"
@@ -310,9 +337,7 @@ for _, fila_excel in viajes_df.iterrows():
             pass
         continue
 
-    # Si el popup abre una nueva ventana del navegador, cambiar el foco a ella.
-    # Si la ventana de docs es un panel inline en la misma página, este bloque
-    # no afectará nada (driver.window_handles tendrá solo 1 handle).
+    # Manejar el caso en que el popup abra una nueva ventana del navegador
     ventana_principal = driver.current_window_handle
     ventanas_abiertas = driver.window_handles
     if len(ventanas_abiertas) > 1:
@@ -321,7 +346,7 @@ for _, fila_excel in viajes_df.iterrows():
                 driver.switch_to.window(ventana)
                 break
 
-    # ---- c) Descargar documentos según tipo de destino ----
+    # ── c) Descargar documentos según tipo de destino ────────────────────────
     docs_descargados_viaje = []
 
     for tipo_doc in docs_requeridos:
@@ -329,10 +354,10 @@ for _, fila_excel in viajes_df.iterrows():
 
         for intento in range(1, 3):  # Máximo 2 intentos por documento
             try:
-                # Buscar todas las filas que contienen un botón de descarga (span.btnvalignmiddle).
-                # NOTA: Si la ventana de docs usa un contenedor/iframe específico, ajusta el
-                # XPATH para buscar dentro de ese contenedor, ej:
-                #   "//div[@id='ID_CONTENEDOR_DOCS']//tr[.//span[@class='btnvalignmiddle']]"
+                # Buscar filas de la ventana de documentos que contengan botón de descarga.
+                # La ventana muestra cada documento como fila (<tr>) con un ícono de hoja/descarga.
+                # Si el sistema usa un contenedor con ID específico, acota el XPATH:
+                #   "//div[@id='ID_CONTENEDOR']//tr[.//span[@class='btnvalignmiddle']]"
                 filas_doc = driver.find_elements(
                     By.XPATH,
                     "//tr[.//span[@class='btnvalignmiddle']]"
@@ -340,15 +365,13 @@ for _, fila_excel in viajes_df.iterrows():
 
                 if not filas_doc:
                     escribir_log(
-                        f"⚠️ No se encontraron filas de documentos en la ventana "
-                        f"para viaje {numero_viaje}."
+                        f"⚠️ Sin filas de documentos en la ventana del viaje {numero_viaje}."
                     )
                     break
 
                 boton_descarga = None
                 for fila in filas_doc:
-                    texto_fila = fila.text
-                    if fila_contiene_tipo_doc(texto_fila, tipo_doc):
+                    if fila_contiene_tipo_doc(fila.text, tipo_doc):
                         try:
                             boton_descarga = fila.find_element(
                                 By.XPATH, ".//span[@class='btnvalignmiddle']"
@@ -359,42 +382,41 @@ for _, fila_excel in viajes_df.iterrows():
 
                 if boton_descarga is None:
                     escribir_log(
-                        f"⚠️ Documento '{tipo_doc}' no encontrado en la ventana "
+                        f"⚠️ Documento '{tipo_doc}' no encontrado en ventana "
                         f"del viaje {numero_viaje}."
                     )
                     break
 
-                # Tomar snapshot de archivos en carpeta temporal antes de descargar
+                # Snapshot previo para detectar archivo nuevo
                 archivos_antes = {f for f in carpeta_temp.iterdir() if f.is_file()}
 
                 boton_descarga.click()
                 escribir_log(
-                    f"📌 Descargando '{tipo_doc}' del viaje {numero_viaje} "
+                    f"📌 Descargando '{tipo_doc}' — viaje {numero_viaje} "
                     f"(intento {intento})..."
                 )
 
-                # Esperar a que aparezca el archivo descargado
                 archivo_nuevo = esperar_archivo_nuevo(carpeta_temp, archivos_antes)
 
                 if archivo_nuevo:
-                    extension      = archivo_nuevo.suffix if archivo_nuevo.suffix else ".pdf"
+                    extension      = archivo_nuevo.suffix or ".pdf"
                     nombre_destino = carpeta_viaje / f"{tipo_doc}_{numero_viaje}{extension}"
                     shutil.move(str(archivo_nuevo), str(nombre_destino))
-                    escribir_log(f"✅ '{tipo_doc}' guardado como: {nombre_destino}")
+                    escribir_log(f"✅ '{tipo_doc}' guardado: {nombre_destino}")
                     docs_descargados_viaje.append(tipo_doc)
                     documentos_descargados += 1
                     descargado = True
                     break
                 else:
                     escribir_log(
-                        f"⚠️ No apareció archivo de '{tipo_doc}' en el intento {intento}. "
-                        f"Esperando {SLEEP_RETRY}s antes de reintentar..."
+                        f"⚠️ No apareció archivo de '{tipo_doc}' (intento {intento}). "
+                        f"Reintentando en {SLEEP_RETRY}s..."
                     )
                     time.sleep(SLEEP_RETRY)
 
             except Exception as e:
                 escribir_log(
-                    f"⚠️ Error al descargar '{tipo_doc}' para viaje {numero_viaje} "
+                    f"⚠️ Error al descargar '{tipo_doc}' viaje {numero_viaje} "
                     f"(intento {intento}): {e}"
                 )
                 time.sleep(SLEEP_RETRY)
@@ -405,35 +427,51 @@ for _, fila_excel in viajes_df.iterrows():
                 f"tras 2 intentos."
             )
 
-    # Registrar viaje con error si faltaron documentos
+    # Registrar error si faltaron documentos
     faltantes = [d for d in docs_requeridos if d not in docs_descargados_viaje]
     if faltantes:
-        escribir_log(
-            f"⚠️ Viaje {numero_viaje}: documentos NO descargados: {faltantes}"
-        )
+        escribir_log(f"⚠️ Viaje {numero_viaje} — documentos faltantes: {faltantes}")
         if numero_viaje not in viajes_con_error:
             viajes_con_error.append(numero_viaje)
 
     viajes_procesados += 1
 
-    # ---- d) Regresar a ventana principal si se abrió nueva ventana ----
+    # ── d) Volver a ventana principal si se abrió nueva ─────────────────────
     if driver.current_window_handle != ventana_principal:
         driver.close()
         driver.switch_to.window(ventana_principal)
         time.sleep(SLEEP_POPUP)
 
-    # ---- e) Cerrar ventana de documentos (BTN_CANCELAR) ----
+    # ── e) Cerrar ventana de documentos (botón "Regresar") ──────────────────
+    cerrado = False
+    # Intento 1: por NAME del input (BTN_CANCELAR es el ID interno en AWP)
     try:
-        boton_cancelar = wait.until(
+        boton_regresar = wait.until(
             EC.element_to_be_clickable((By.NAME, "BTN_CANCELAR"))
         )
-        boton_cancelar.click()
-        time.sleep(SLEEP_POPUP)
+        boton_regresar.click()
+        cerrado = True
+    except:
+        pass
+    # Intento 2: por texto visible del botón si el ID no funciona
+    if not cerrado:
+        try:
+            boton_regresar = driver.find_element(
+                By.XPATH,
+                "//input[@value='Regresar'] | //button[contains(text(),'Regresar')] "
+                "| //span[contains(text(),'Regresar')]"
+            )
+            boton_regresar.click()
+            cerrado = True
+        except:
+            pass
+    if cerrado:
         escribir_log(f"📌 Ventana de documentos cerrada para viaje {numero_viaje}.")
-    except Exception as e:
-        escribir_log(f"⚠️ No se encontró BTN_CANCELAR para viaje {numero_viaje}: {e}")
+    else:
+        escribir_log(f"⚠️ No se encontró botón Regresar/BTN_CANCELAR para viaje {numero_viaje}.")
+    time.sleep(SLEEP_POPUP)
 
-    # ---- f) Limpiar buscador y esperar tabla ----
+    # ── f) Limpiar buscador y continuar ─────────────────────────────────────
     try:
         buscador = wait.until(
             EC.presence_of_element_located(
@@ -472,7 +510,7 @@ except:
 driver.quit()
 escribir_log("✅ Navegador cerrado correctamente.")
 
-# Eliminar carpeta temporal si quedó vacía
+# Limpiar carpeta temporal si quedó vacía
 try:
     if carpeta_temp.exists() and not any(carpeta_temp.iterdir()):
         carpeta_temp.rmdir()
