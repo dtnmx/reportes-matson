@@ -56,10 +56,23 @@ FECHA_HOY    = datetime.now().strftime("%Y%m%d")
 CARPETA_BASE = f"MATSON_Docs_{FECHA_HOY}"
 
 # --- Documentos a descargar por tipo ---
+# Cada entrada es un dict con:
+#   "id"     → nombre usado para el archivo descargado (ej. CI_4792578.pdf)
+#   "buscar" → texto EXACTO que aparece en la fila del popup de GM
+#              (verificado en DevTools: CI, PODC, POD USA, BOL)
 DOCS_POR_TIPO = {
-    "LG":    ["CI"],
-    "USA":   ["CI", "BOL", "POD"],
-    "TODOS": ["CI", "BOL"],
+    "LG":    [
+        {"id": "CI",  "buscar": "CI"},
+    ],
+    "USA":   [
+        {"id": "CI",      "buscar": "CI"},
+        {"id": "BOL",     "buscar": "BOL"},
+        {"id": "POD",     "buscar": "POD USA"},   # Nombre en GM: "POD USA", archivo: POD_XXXXX.pdf
+    ],
+    "TODOS": [
+        {"id": "CI",  "buscar": "CI"},
+        {"id": "BOL", "buscar": "BOL"},
+    ],
 }
 
 # --- Tiempos de espera (segundos) ---
@@ -104,13 +117,13 @@ def esperar_archivo_nuevo(carpeta: Path, archivos_antes: set, timeout: int = SLE
     return None
 
 
-def fila_contiene_tipo_doc(texto_fila: str, tipo_doc: str) -> bool:
+def fila_coincide(texto_fila: str, termino_busqueda: str) -> bool:
     """
-    Verifica si el texto de una fila de la ventana de documentos corresponde al tipo buscado.
-    Busca el código exacto (CI, BOL, POD) en el texto de la fila.
-    Ajustar si GM usa nombres completos como "CARTA PORTE", "BILL OF LADING", etc.
+    Verifica si el texto de una fila del popup coincide con el término de búsqueda.
+    Usa comparación exacta (strip) para evitar que "CI" matchee "PODC" o
+    que "POD" matchee "PODC" en lugar de "POD USA".
     """
-    return tipo_doc.upper() in texto_fila.upper()
+    return texto_fila.strip().upper() == termino_busqueda.strip().upper()
 
 
 # ============================================================
@@ -234,7 +247,8 @@ df["_tipo_descarga"] = df.apply(
 escribir_log(f"✅ {len(df)} viajes cargados del Excel.")
 escribir_log("📌 Distribución de tipos de descarga:")
 for tipo, conteo in df["_tipo_descarga"].value_counts().items():
-    escribir_log(f"   {tipo}: {conteo} viajes → {DOCS_POR_TIPO[tipo]}")
+    ids = [d["id"] for d in DOCS_POR_TIPO[tipo]]
+    escribir_log(f"   {tipo}: {conteo} viajes → {ids}")
 
 # ============================================================
 #  NAVEGAR A TRÁFICO → VIAJES
@@ -290,7 +304,7 @@ for _, fila_excel in df.iterrows():
     escribir_log(f"\n{'='*60}")
     escribir_log(
         f"📌 Viaje: {numero_viaje} | Tipo: {tipo_descarga} | "
-        f"Ruta: {ruta_concepto[:50]} | Docs: {docs_requeridos}"
+        f"Ruta: {ruta_concepto[:50]} | Docs: {[d['id'] for d in docs_requeridos]}"
     )
 
     # Carpeta destino del viaje
@@ -347,17 +361,18 @@ for _, fila_excel in df.iterrows():
                 break
 
     # ── c) Descargar documentos según tipo de destino ────────────────────────
-    docs_descargados_viaje = []
+    # docs_requeridos es una lista de dicts: {"id": "CI", "buscar": "CI"}, etc.
+    ids_descargados = []
 
-    for tipo_doc in docs_requeridos:
+    for doc in docs_requeridos:
+        doc_id     = doc["id"]      # nombre en el archivo resultante (ej. "POD")
+        doc_buscar = doc["buscar"]  # texto exacto de la fila en GM (ej. "POD USA")
         descargado = False
 
         for intento in range(1, 3):  # Máximo 2 intentos por documento
             try:
-                # Buscar filas de la ventana de documentos que contengan botón de descarga.
-                # La ventana muestra cada documento como fila (<tr>) con un ícono de hoja/descarga.
-                # Si el sistema usa un contenedor con ID específico, acota el XPATH:
-                #   "//div[@id='ID_CONTENEDOR']//tr[.//span[@class='btnvalignmiddle']]"
+                # Filas del popup "Documentos Adjuntos de Viaje".
+                # Cada fila tiene texto (CI / PODC / POD USA / BOL) y un span.btnvalignmiddle.
                 filas_doc = driver.find_elements(
                     By.XPATH,
                     "//tr[.//span[@class='btnvalignmiddle']]"
@@ -371,7 +386,7 @@ for _, fila_excel in df.iterrows():
 
                 boton_descarga = None
                 for fila in filas_doc:
-                    if fila_contiene_tipo_doc(fila.text, tipo_doc):
+                    if fila_coincide(fila.text, doc_buscar):
                         try:
                             boton_descarga = fila.find_element(
                                 By.XPATH, ".//span[@class='btnvalignmiddle']"
@@ -382,7 +397,7 @@ for _, fila_excel in df.iterrows():
 
                 if boton_descarga is None:
                     escribir_log(
-                        f"⚠️ Documento '{tipo_doc}' no encontrado en ventana "
+                        f"⚠️ '{doc_buscar}' no encontrado en ventana "
                         f"del viaje {numero_viaje}."
                     )
                     break
@@ -392,7 +407,7 @@ for _, fila_excel in df.iterrows():
 
                 boton_descarga.click()
                 escribir_log(
-                    f"📌 Descargando '{tipo_doc}' — viaje {numero_viaje} "
+                    f"📌 Descargando '{doc_buscar}' — viaje {numero_viaje} "
                     f"(intento {intento})..."
                 )
 
@@ -400,35 +415,36 @@ for _, fila_excel in df.iterrows():
 
                 if archivo_nuevo:
                     extension      = archivo_nuevo.suffix or ".pdf"
-                    nombre_destino = carpeta_viaje / f"{tipo_doc}_{numero_viaje}{extension}"
+                    nombre_destino = carpeta_viaje / f"{doc_id}_{numero_viaje}{extension}"
                     shutil.move(str(archivo_nuevo), str(nombre_destino))
-                    escribir_log(f"✅ '{tipo_doc}' guardado: {nombre_destino}")
-                    docs_descargados_viaje.append(tipo_doc)
+                    escribir_log(f"✅ '{doc_id}' guardado: {nombre_destino}")
+                    ids_descargados.append(doc_id)
                     documentos_descargados += 1
                     descargado = True
                     break
                 else:
                     escribir_log(
-                        f"⚠️ No apareció archivo de '{tipo_doc}' (intento {intento}). "
+                        f"⚠️ No apareció archivo de '{doc_buscar}' (intento {intento}). "
                         f"Reintentando en {SLEEP_RETRY}s..."
                     )
                     time.sleep(SLEEP_RETRY)
 
             except Exception as e:
                 escribir_log(
-                    f"⚠️ Error al descargar '{tipo_doc}' viaje {numero_viaje} "
+                    f"⚠️ Error al descargar '{doc_buscar}' viaje {numero_viaje} "
                     f"(intento {intento}): {e}"
                 )
                 time.sleep(SLEEP_RETRY)
 
         if not descargado:
             escribir_log(
-                f"❌ No se pudo descargar '{tipo_doc}' para viaje {numero_viaje} "
+                f"❌ No se pudo descargar '{doc_buscar}' para viaje {numero_viaje} "
                 f"tras 2 intentos."
             )
 
     # Registrar error si faltaron documentos
-    faltantes = [d for d in docs_requeridos if d not in docs_descargados_viaje]
+    ids_requeridos = [d["id"] for d in docs_requeridos]
+    faltantes = [d for d in ids_requeridos if d not in ids_descargados]
     if faltantes:
         escribir_log(f"⚠️ Viaje {numero_viaje} — documentos faltantes: {faltantes}")
         if numero_viaje not in viajes_con_error:
