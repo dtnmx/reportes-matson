@@ -22,6 +22,7 @@ from pathlib import Path
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
@@ -81,8 +82,9 @@ SLEEP_LOGIN    = 5    # Tras clic de login y tras cerrar alert
 SLEEP_MODULO   = 3    # Tras navegar entre módulos/secciones del menú
 SLEEP_FILTRO   = 2    # Tras escribir en el buscador de la tabla de viajes
 SLEEP_POPUP    = 3    # Tras abrir o cerrar la ventana de documentos adjuntos
-SLEEP_DESCARGA = 12   # Segundos máximos para que aparezca el archivo descargado
-SLEEP_RETRY    = 3    # Espera antes de reintentar una descarga fallida
+SLEEP_DESCARGA     = 12   # Segundos máximos para que aparezca el archivo descargado
+SLEEP_RETRY        = 3    # Espera antes de reintentar una descarga fallida
+SLEEP_CARGA_VIAJES = 60   # Segundos de espera tras "Aplicar" para que cargue la tabla de viajes
 
 # ============================================================
 #  FUNCIONES AUXILIARES
@@ -284,6 +286,52 @@ try:
     escribir_log("✅ Sección 'Viajes' abierta.")
 except Exception as e:
     escribir_log(f"❌ Error al acceder a 'Viajes': {e}", nivel="error")
+    driver.quit()
+    sys.exit(1)
+
+# ============================================================
+#  FILTRO DE FECHA: establecer "Desde" = hoy - 2 meses y Aplicar
+# ============================================================
+
+# Calcular fecha de hace 2 meses (día 1 del mes, sin dependencias externas)
+_hoy  = datetime.now()
+_mes  = _hoy.month - 2
+_anio = _hoy.year
+if _mes <= 0:
+    _mes  += 12
+    _anio -= 1
+FECHA_DESDE = f"01/{_mes:02d}/{_anio}"
+
+try:
+    escribir_log(f"📌 Estableciendo fecha 'Desde': {FECHA_DESDE}...")
+
+    campo_desde = wait.until(
+        EC.presence_of_element_located((By.ID, "EDT_DESDE"))
+    )
+    # Triple-click para seleccionar todo el contenido antes de reemplazar
+    campo_desde.click()
+    campo_desde.send_keys(Keys.CONTROL + "a")
+    campo_desde.clear()
+    campo_desde.send_keys(FECHA_DESDE)
+    # Tab para disparar el onblur y que GM valide el formato
+    campo_desde.send_keys(Keys.TAB)
+    time.sleep(1)
+
+    # Clic en "Aplicar" — el span contiene "Aplicar" + espacios &nbsp;
+    boton_aplicar = driver.find_element(
+        By.XPATH,
+        "//span[@class='btnvalignmiddle' and contains(., 'Aplicar')]"
+    )
+    boton_aplicar.click()
+    escribir_log(
+        f"✅ Fecha 'Desde' establecida en {FECHA_DESDE}. "
+        f"Esperando {SLEEP_CARGA_VIAJES}s para que cargue la tabla..."
+    )
+    time.sleep(SLEEP_CARGA_VIAJES)
+    escribir_log("✅ Tabla de viajes lista. Iniciando procesamiento.")
+
+except Exception as e:
+    escribir_log(f"❌ Error al establecer fecha 'Desde' o al hacer clic en Aplicar: {e}", nivel="error")
     driver.quit()
     sys.exit(1)
 
